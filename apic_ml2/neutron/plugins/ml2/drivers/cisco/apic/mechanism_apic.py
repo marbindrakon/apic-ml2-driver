@@ -53,6 +53,7 @@ from oslo_utils import importutils
 
 from apic_ml2.neutron.db import l3out_vlan_allocation as l3out_vlan_alloc
 from apic_ml2.neutron.db import port_ha_ipaddress_binding as ha_ip_db
+from apic_ml2.neutron.extensions import cisco_apic
 from apic_ml2.neutron.plugins.ml2.drivers.cisco.apic import (
     network_constraints as net_cons)
 from apic_ml2.neutron.plugins.ml2.drivers.cisco.apic import apic_model
@@ -576,6 +577,7 @@ class APICMechanismDriver(api.MechanismDriver,
     def request_vrf_details(self, context, **kwargs):
         return self.get_vrf_details(context, **kwargs)
 
+    # TBD
     # RPC Method
     def get_vrf_details(self, context, **kwargs):
         core_plugin = manager.NeutronManager.get_plugin()
@@ -598,8 +600,30 @@ class APICMechanismDriver(api.MechanismDriver,
                                   'device_id': [router['id']]})
                 nets = set([p['network_id'] for p in intf_ports])
             else:
-                nets = core_plugin.get_networks(ctx, {'tenant_id': [vrf_id]})
-                nets = [n['id'] for n in nets]
+                networks = core_plugin.get_networks(ctx,
+                                                    {'tenant_id': [vrf_id]})
+                nets = [n['id'] for n in networks]
+                obj = {}
+                obj['tenant_id'] = vrf_id
+                # for route leak case
+                if self._is_vrf_per_router(obj):
+                    intf_ports = core_plugin.get_ports(
+                        ctx, filters={'device_owner':
+                                      [n_constants.DEVICE_OWNER_ROUTER_INTF]})
+                    intf_nets = set([p['network_id'] for p in intf_ports])
+                    route_leak_nets = [n['id'] for n in networks if
+                                       n.get(cisco_apic.ALLOW_ROUTE_LEAK,
+                                             False)]
+                    nets = (set(nets) - intf_nets) | set(route_leak_nets)
+                    # calculate the route_leak section
+                    # need router_id and network_name
+                    for route_leak_net in route_leak_nets:
+                        pass
+
+
+
+
+                    
             subnets = core_plugin.get_subnets(ctx,
                                               filters={'network_id': nets})
         else:
@@ -689,7 +713,9 @@ class APICMechanismDriver(api.MechanismDriver,
             details['endpoint_group_name'] = self._get_ext_epg_for_ext_net(
                 details['endpoint_group_name'])
         router_id = None
-        if self.fabric_l3 and self._is_vrf_per_router(network):
+        # TBD
+        if (self.fabric_l3 and self._is_vrf_per_router(network) and
+                not network.get(cisco_apic.ALLOW_ROUTE_LEAK, False)):
             intf_ports = core_plugin.get_ports(
                 context,
                 filters={'device_owner':
@@ -1047,23 +1073,82 @@ class APICMechanismDriver(api.MechanismDriver,
             if is_vrf_per_router:
                 vrf_info = self._get_router_vrf(router)
                 if is_delete:
-                    # point BD back to the default VRF for this tenant
-                    # if router is not connected to any subnet anymore
-                    intf_ports = context._plugin.get_ports(
-                        context._plugin_context,
-                        filters={'device_owner':
-                                 [n_constants.DEVICE_OWNER_ROUTER_INTF],
-                                 'device_id': [router['id']],
-                                 'network_id': [network['id']]})
-                    if not [p for p in intf_ports if p['id'] != port['id']]:
-                        vrf_default = self._get_network_vrf(context, network)
-                        self.apic_manager.set_context_for_bd(
-                            bd_tenant, bd_name, vrf_default['aci_name'],
-                            transaction=trs)
+                    # TBD
+                    # route leak network
+                    if network.get(cisco_apic.ALLOW_ROUTE_LEAK, False):
+                        epg_name = self.name_mapper.endpoint_group(
+                            context, network['id'])
+                        leak_epg_name = self._get_leak_name_for_net(
+                            router_id, epg_name)
+                        leak_bd_name = self._get_leak_name_for_net(router_id,
+                                                                   bd_name)
+                        self.apic_manager.delete_epg_for_network(
+                            bd_tenant, leak_epg_name,
+                            app_profile_name=self._get_network_app_profile(
+                                network), transaction=trs)
+                        self.apic_manager.delete_bd_on_apic(
+                            bd_tenant, leak_bd_name, transaction=trs)
+                    else:
+                        # point BD back to the default VRF for this tenant
+                        # if router is not connected to any subnet anymore
+                        intf_ports = context._plugin.get_ports(
+                            context._plugin_context,
+                            filters={'device_owner':
+                                     [n_constants.DEVICE_OWNER_ROUTER_INTF],
+                                     'device_id': [router['id']],
+                                     'network_id': [network['id']]})
+                        if not [p for p in intf_ports
+                                if p['id'] != port['id']]:
+                            vrf_default = self._get_network_vrf(context,
+                                                                network)
+                            self.apic_manager.set_context_for_bd(
+                                bd_tenant, bd_name, vrf_default['aci_name'],
+                                transaction=trs)
                 else:
-                    self.apic_manager.set_context_for_bd(
-                        bd_tenant, bd_name, vrf_info['aci_name'],
-                        transaction=trs)
+                    # TBD
+                    # route leak network
+                    if network.get(cisco_apic.ALLOW_ROUTE_LEAK, False):
+                        epg_name = self.name_mapper.endpoint_group(
+                            context, network['id'])
+                        leak_bd_name = self._get_leak_name_for_net(router_id,
+                                                                   bd_name)
+                        leak_epg_name = self._get_leak_name_for_net(
+                            router_id, epg_name)
+                        app_profile_name = self._get_network_app_profile(
+                            network)
+                        self.apic_manager.ensure_bd_created_on_apic(
+                            bd_tenant, leak_bd_name,
+                            ctx_owner=vrf_info['aci_tenant'],
+                            ctx_name=vrf_info['aci_name'], transaction=trs)
+                        self.apic_manager.ensure_epg_created(
+                            bd_tenant, leak_epg_name, bd_name=leak_bd_name,
+                            app_profile_name=app_profile_name, transaction=trs)
+                        # create any required subnets in BD
+                        subnet_ids = [x['subnet_id']
+                                      for x in port['fixed_ips']]
+                        subnets = context._plugin.get_subnets(
+                            context._plugin_context,
+                            filters={'id': subnet_ids})
+                        info = self._get_subnet_info(context, subnets[0])
+                        if info:
+                            tenant_id, network_id, gateway_ip = info
+                            self.apic_manager.ensure_subnet_created_on_apic(
+                                bd_tenant, leak_bd_name, gateway_ip,
+                                scope=getattr(context, 'subnet_scope', None),
+                                transaction=trs)
+                        # set up the contract for EPG
+                        contract_name = 'contract-%s' % router_id
+                        self.apic_manager.set_contract_for_epg(
+                            bd_tenant, leak_epg_name, contract_name,
+                            app_profile_name=app_profile_name, transaction=trs)
+                        self.apic_manager.set_contract_for_epg(
+                            bd_tenant, leak_epg_name, contract_name,
+                            app_profile_name=app_profile_name, provider=True,
+                            transaction=trs)
+                    else:
+                        self.apic_manager.set_context_for_bd(
+                            bd_tenant, bd_name, vrf_info['aci_name'],
+                            transaction=trs)
 
             if not router.get('external_gateway_info'):
                 return
@@ -1265,6 +1350,8 @@ class APICMechanismDriver(api.MechanismDriver,
             return
         if self._is_vrf_per_router(router):
             network = context.network.current
+            if network.get(cisco_apic.ALLOW_ROUTE_LEAK, False):
+                return
             other_ports = context._plugin.get_ports(
                 context._plugin_context,
                 filters={
@@ -1746,6 +1833,9 @@ class APICMechanismDriver(api.MechanismDriver,
         else:
             return "Shd-%s" % name
 
+    def _get_leak_name_for_net(self, router_id, name):
+        return "Leak-%s-%s" % (router_id, name)
+
     def _get_ext_allow_all_contract(self, network):
         return "EXT-%s-allow-all" % network['id']
 
@@ -2070,7 +2160,6 @@ class APICMechanismDriver(api.MechanismDriver,
                 admin_ctx, [router_port['device_id']])
         else:
             return
-
         subnets = core_plugin.get_subnets(
             admin_ctx, filters={'id': list(subnet_ids)})
         nets = set([x['network_id'] for x in subnets])
