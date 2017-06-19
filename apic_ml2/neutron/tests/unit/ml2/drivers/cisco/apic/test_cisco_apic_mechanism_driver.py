@@ -41,6 +41,7 @@ from neutron.tests.unit.api import test_extensions
 from neutron.tests.unit.db import test_db_base_plugin_v2 as test_plugin
 from neutron.tests.unit import testlib_api
 from opflexagent import constants as ofcst
+from oslo_log import log
 from oslo_serialization import jsonutils as json
 # Mock the opflex agent type driver, and its constants,
 # so that we can test port binding to opflex networks
@@ -67,6 +68,7 @@ from apic_ml2.neutron.tests.unit.ml2.drivers.cisco.apic import (
 
 sys.modules["apicapi"].apic_manager.EXT_EPG = mocked.APIC_EXT_EPG
 
+LOG = log.getLogger(__name__)
 
 HOST_ID1 = 'ubuntu'
 HOST_ID2 = 'rhel'
@@ -3781,6 +3783,8 @@ class ApicML2IntegratedTestCaseSingleVRF(ApicML2IntegratedTestCase):
                        fixed_ips=[{'subnet_id': sub2['subnet']['id']}],
                        tenant_id=mocked.APIC_TENANT) as p:
             p2_1 = p['port']
+        port_ids = [p1['id'], p1_1['id'], p2['id'], p2_1['id']]
+        LOG.warning("port IDs are %s" % port_ids)
 
         self.mgr.add_router_interface = mock.Mock()
         self.driver.notifier.port_update = mock.Mock()
@@ -3800,6 +3804,7 @@ class ApicML2IntegratedTestCaseSingleVRF(ApicML2IntegratedTestCase):
         updates = sorted(set(
             [pt[0][1]['id']
              for pt in self.driver.notifier.port_update.call_args_list]))
+        LOG.warning("updates are %s" % self.driver.notifier.port_update.call_args_list)
         self.assertEqual(sorted([p1['id'], p1_1['id']]), updates)
 
         self.driver.notifier.port_update.reset_mock()
